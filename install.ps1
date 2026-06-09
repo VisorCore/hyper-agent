@@ -65,7 +65,7 @@ function ConvertTo-VisorCoreGb {
 
 function Get-VisorCoreInventory {
     $inventory = @{
-        agent_version = "0.2.0"
+        agent_version = "0.3.0"
         synced_at_utc = (Get-Date).ToUniversalTime().ToString("o")
         host = @{}
         vms = @()
@@ -218,6 +218,121 @@ function Get-VisorCoreInventory {
     return $inventory
 }
 
+function Invoke-VisorCoreCommand {
+    param($Command)
+
+    $result = @{
+        id = [string] $Command.id
+        action = [string] $Command.action
+        success = $false
+        status = "failed"
+        message = ""
+        completed_at = (Get-Date).ToUniversalTime().ToString("o")
+    }
+
+    try {
+        Import-Module Hyper-V -ErrorAction Stop
+        $action = [string] $Command.action
+        $targetName = [string] $Command.target_name
+        $options = $Command.options
+        if ($null -eq $options) {
+            $options = @{}
+        }
+        if ([string]::IsNullOrWhiteSpace($targetName)) {
+            throw "Command target is missing."
+        }
+
+        switch ($action) {
+            "vm.start" {
+                Start-VM -Name $targetName -ErrorAction Stop | Out-Null
+                $result.message = "VM '$targetName' started."
+            }
+            "vm.stop" {
+                Stop-VM -Name $targetName -Force -ErrorAction Stop | Out-Null
+                $result.message = "VM '$targetName' stopped."
+            }
+            "vm.restart" {
+                Restart-VM -Name $targetName -Force -ErrorAction Stop | Out-Null
+                $result.message = "VM '$targetName' restarted."
+            }
+            "vm.pause" {
+                Suspend-VM -Name $targetName -ErrorAction Stop | Out-Null
+                $result.message = "VM '$targetName' paused."
+            }
+            "vm.resume" {
+                Resume-VM -Name $targetName -ErrorAction Stop | Out-Null
+                $result.message = "VM '$targetName' resumed."
+            }
+            "vm.save" {
+                Save-VM -Name $targetName -ErrorAction Stop | Out-Null
+                $result.message = "VM '$targetName' saved."
+            }
+            "vm.checkpoint" {
+                $checkpointName = [string] $options.name
+                if ([string]::IsNullOrWhiteSpace($checkpointName)) {
+                    $checkpointName = "VisorCore " + (Get-Date).ToString("yyyy-MM-dd HHmmss")
+                }
+                Checkpoint-VM -Name $targetName -SnapshotName $checkpointName -ErrorAction Stop | Out-Null
+                $result.message = "Checkpoint '$checkpointName' created for VM '$targetName'."
+            }
+            "vm.rename" {
+                $newName = [string] $options.new_name
+                if ([string]::IsNullOrWhiteSpace($newName)) { throw "New VM name is required." }
+                Rename-VM -Name $targetName -NewName $newName -ErrorAction Stop | Out-Null
+                $result.message = "VM '$targetName' renamed to '$newName'."
+            }
+            "vm.set_cpu" {
+                $count = [int] $options.count
+                if ($count -lt 1 -or $count -gt 256) { throw "CPU count must be between 1 and 256." }
+                Set-VMProcessor -VMName $targetName -Count $count -ErrorAction Stop | Out-Null
+                $result.message = "VM '$targetName' CPU count set to $count."
+            }
+            "vm.set_memory" {
+                $startupGb = [double] $options.startup_gb
+                if ($startupGb -le 0 -or $startupGb -gt 4096) { throw "Startup memory must be between 1 GB and 4096 GB." }
+                Set-VMMemory -VMName $targetName -StartupBytes ([int64]($startupGb * 1GB)) -ErrorAction Stop | Out-Null
+                $result.message = "VM '$targetName' startup memory set to $startupGb GB."
+            }
+            "checkpoint.delete" {
+                $vmName = [string] $options.vm_name
+                if ([string]::IsNullOrWhiteSpace($vmName)) { throw "VM name is required for checkpoint deletion." }
+                Remove-VMCheckpoint -VMName $vmName -Name $targetName -Confirm:$false -ErrorAction Stop
+                $result.message = "Checkpoint '$targetName' deleted from VM '$vmName'."
+            }
+            "checkpoint.apply" {
+                $vmName = [string] $options.vm_name
+                if ([string]::IsNullOrWhiteSpace($vmName)) { throw "VM name is required for checkpoint restore." }
+                $checkpoint = Get-VMCheckpoint -VMName $vmName -Name $targetName -ErrorAction Stop
+                Restore-VMCheckpoint -VMCheckpoint $checkpoint -Confirm:$false -ErrorAction Stop
+                $result.message = "Checkpoint '$targetName' applied to VM '$vmName'."
+            }
+            "switch.rename" {
+                $newName = [string] $options.new_name
+                if ([string]::IsNullOrWhiteSpace($newName)) { throw "New switch name is required." }
+                Rename-VMSwitch -Name $targetName -NewName $newName -ErrorAction Stop | Out-Null
+                $result.message = "Switch '$targetName' renamed to '$newName'."
+            }
+            "switch.set_notes" {
+                $notes = [string] $options.notes
+                Set-VMSwitch -Name $targetName -Notes $notes -ErrorAction Stop | Out-Null
+                $result.message = "Switch '$targetName' notes updated."
+            }
+            default {
+                throw "Command action '$action' is not supported by this agent."
+            }
+        }
+
+        $result.success = $true
+        $result.status = "succeeded"
+    } catch {
+        $result.success = $false
+        $result.status = "failed"
+        $result.message = $_.Exception.Message
+    }
+
+    return $result
+}
+
 Write-VisorCoreAgentLog "scheduled task agent started"
 
 while ($true) {
@@ -250,6 +365,27 @@ while ($true) {
 
         $response = Invoke-RestMethod -Uri ($portal.TrimEnd("/") + "/api/agent/checkin") -Method Post -Body $body -ContentType "application/json" -UserAgent "curl/8.0" -ErrorAction Stop
         Write-VisorCoreAgentLog "check-in ok"
+
+        if ($response.commands) {
+            $commandResults = @()
+            foreach ($command in @($response.commands)) {
+                $commandResult = Invoke-VisorCoreCommand -Command $command
+                $commandResults += $commandResult
+                Write-VisorCoreAgentLog ("command " + $commandResult.id + " " + $commandResult.status + ": " + $commandResult.message)
+            }
+            if (@($commandResults).Count -gt 0) {
+                try {
+                    $payload["inventory"] = Get-VisorCoreInventory
+                    $payload["command_results"] = $commandResults
+                    $resultBody = $payload | ConvertTo-Json -Depth 10
+                    Invoke-RestMethod -Uri ($portal.TrimEnd("/") + "/api/agent/checkin") -Method Post -Body $resultBody -ContentType "application/json" -UserAgent "curl/8.0" -ErrorAction Stop | Out-Null
+                    Write-VisorCoreAgentLog "command results posted"
+                    $payload.Remove("command_results")
+                } catch {
+                    Write-VisorCoreAgentLog ("command result post failed: " + $_.Exception.Message)
+                }
+            }
+        }
 
         if ($response.uninstall_service -eq $true -or $response.uninstall_agent -eq $true) {
             try {

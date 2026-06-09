@@ -65,9 +65,22 @@ function ConvertTo-VisorCoreGb {
 
 function Get-VisorCoreInventory {
     $inventory = @{
-        agent_version = "0.5.0"
+        agent_version = "0.6.0"
         synced_at_utc = (Get-Date).ToUniversalTime().ToString("o")
         host = @{}
+        storage = @{
+            total_gb = 0
+            free_gb = 0
+            used_gb = 0
+        }
+        volumes = @()
+        network = @{
+            rx_mbps = 0
+            tx_mbps = 0
+            rx_bytes_per_sec = 0
+            tx_bytes_per_sec = 0
+            adapters = @()
+        }
         vms = @()
         switches = @()
         checkpoints = @()
@@ -86,13 +99,103 @@ function Get-VisorCoreInventory {
     try {
         $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
         $computer = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+        $processors = @()
+        try { $processors = @(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue) } catch {}
+        $logicalProcessors = 0
+        $physicalProcessors = 0
+        $cpuLoadTotal = 0
+        $cpuLoadSamples = 0
+        foreach ($processor in $processors) {
+            try { $logicalProcessors += [int] $processor.NumberOfLogicalProcessors } catch {}
+            $physicalProcessors += 1
+            if ($null -ne $processor.LoadPercentage) {
+                $cpuLoadTotal += [double] $processor.LoadPercentage
+                $cpuLoadSamples += 1
+            }
+        }
+        if ($logicalProcessors -le 0 -and $computer) {
+            try { $logicalProcessors = [int] $computer.NumberOfLogicalProcessors } catch {}
+        }
+        if ($physicalProcessors -le 0 -and $computer) {
+            try { $physicalProcessors = [int] $computer.NumberOfProcessors } catch {}
+        }
         $inventory.host = @{
             name = $env:COMPUTERNAME
             os = if ($os) { [string] $os.Caption } else { "" }
             version = if ($os) { [string] $os.Version } else { "" }
             uptime_seconds = if ($os -and $os.LastBootUpTime) { [int] ((Get-Date) - $os.LastBootUpTime).TotalSeconds } else { 0 }
             total_memory_gb = if ($computer) { ConvertTo-VisorCoreGb $computer.TotalPhysicalMemory } else { 0 }
+            logical_processor_count = $logicalProcessors
+            processor_count = $physicalProcessors
+            cpu_load_percent = if ($cpuLoadSamples -gt 0) { [math]::Round(($cpuLoadTotal / $cpuLoadSamples), 0) } else { 0 }
         }
+    } catch {}
+
+    try {
+        $volumes = @(Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" -ErrorAction SilentlyContinue | Select-Object -First 80)
+        $totalGb = 0
+        $freeGb = 0
+        foreach ($volume in $volumes) {
+            $sizeGb = ConvertTo-VisorCoreGb $volume.Size
+            $volumeFreeGb = ConvertTo-VisorCoreGb $volume.FreeSpace
+            $totalGb += [double] $sizeGb
+            $freeGb += [double] $volumeFreeGb
+            $inventory.volumes += @{
+                device_id = [string] $volume.DeviceID
+                name = [string] $volume.VolumeName
+                file_system = [string] $volume.FileSystem
+                size_gb = $sizeGb
+                free_gb = $volumeFreeGb
+                used_gb = [math]::Round(([double] $sizeGb - [double] $volumeFreeGb), 2)
+            }
+        }
+        $inventory.storage = @{
+            total_gb = [math]::Round($totalGb, 2)
+            free_gb = [math]::Round($freeGb, 2)
+            used_gb = [math]::Round(($totalGb - $freeGb), 2)
+        }
+    } catch {}
+
+    try {
+        $samples = @((Get-Counter -Counter "\Network Interface(*)\Bytes Received/sec","\Network Interface(*)\Bytes Sent/sec" -ErrorAction SilentlyContinue).CounterSamples)
+        $adapterMap = @{}
+        foreach ($sample in $samples) {
+            $path = [string] $sample.Path
+            $adapter = ""
+            $direction = ""
+            if ($path -match "\\network interface\((.+)\)\\bytes received/sec$") {
+                $adapter = $Matches[1]
+                $direction = "rx"
+            } elseif ($path -match "\\network interface\((.+)\)\\bytes sent/sec$") {
+                $adapter = $Matches[1]
+                $direction = "tx"
+            }
+            if ([string]::IsNullOrWhiteSpace($adapter)) { continue }
+            $adapterLower = $adapter.ToLowerInvariant()
+            if ($adapterLower -eq "_total" -or $adapterLower -like "*loopback*" -or $adapterLower -like "*isatap*" -or $adapterLower -like "*teredo*") { continue }
+            if (-not $adapterMap.ContainsKey($adapter)) {
+                $adapterMap[$adapter] = @{ name = $adapter; rx_bytes_per_sec = 0; tx_bytes_per_sec = 0; rx_mbps = 0; tx_mbps = 0 }
+            }
+            if ($direction -eq "rx") {
+                $adapterMap[$adapter].rx_bytes_per_sec = [math]::Round([double] $sample.CookedValue, 2)
+            } elseif ($direction -eq "tx") {
+                $adapterMap[$adapter].tx_bytes_per_sec = [math]::Round([double] $sample.CookedValue, 2)
+            }
+        }
+        $rxBytes = 0
+        $txBytes = 0
+        foreach ($adapterName in $adapterMap.Keys) {
+            $adapterStats = $adapterMap[$adapterName]
+            $adapterStats.rx_mbps = [math]::Round((([double] $adapterStats.rx_bytes_per_sec * 8) / 1MB), 2)
+            $adapterStats.tx_mbps = [math]::Round((([double] $adapterStats.tx_bytes_per_sec * 8) / 1MB), 2)
+            $rxBytes += [double] $adapterStats.rx_bytes_per_sec
+            $txBytes += [double] $adapterStats.tx_bytes_per_sec
+            $inventory.network.adapters += $adapterStats
+        }
+        $inventory.network.rx_bytes_per_sec = [math]::Round($rxBytes, 2)
+        $inventory.network.tx_bytes_per_sec = [math]::Round($txBytes, 2)
+        $inventory.network.rx_mbps = [math]::Round((($rxBytes * 8) / 1MB), 2)
+        $inventory.network.tx_mbps = [math]::Round((($txBytes * 8) / 1MB), 2)
     } catch {}
 
     try {

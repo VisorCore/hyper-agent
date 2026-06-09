@@ -65,7 +65,7 @@ function ConvertTo-VisorCoreGb {
 
 function Get-VisorCoreInventory {
     $inventory = @{
-        agent_version = "0.4.0"
+        agent_version = "0.5.0"
         synced_at_utc = (Get-Date).ToUniversalTime().ToString("o")
         host = @{}
         vms = @()
@@ -251,6 +251,14 @@ function Invoke-VisorCoreCommand {
                 Stop-VM -Name $targetName -Force -ErrorAction Stop | Out-Null
                 $result.message = "VM '$targetName' stopped."
             }
+            "vm.shutdown" {
+                Stop-VM -Name $targetName -Shutdown -ErrorAction Stop | Out-Null
+                $result.message = "Guest shutdown requested for VM '$targetName'."
+            }
+            "vm.turn_off" {
+                Stop-VM -Name $targetName -TurnOff -Force -ErrorAction Stop | Out-Null
+                $result.message = "VM '$targetName' powered off."
+            }
             "vm.restart" {
                 Restart-VM -Name $targetName -Force -ErrorAction Stop | Out-Null
                 $result.message = "VM '$targetName' restarted."
@@ -281,6 +289,11 @@ function Invoke-VisorCoreCommand {
                 Rename-VM -Name $targetName -NewName $newName -ErrorAction Stop | Out-Null
                 $result.message = "VM '$targetName' renamed to '$newName'."
             }
+            "vm.set_notes" {
+                $notes = [string] $options.notes
+                Set-VM -Name $targetName -Notes $notes -ErrorAction Stop | Out-Null
+                $result.message = "VM '$targetName' notes updated."
+            }
             "vm.set_cpu" {
                 $count = [int] $options.count
                 if ($count -lt 1 -or $count -gt 256) { throw "CPU count must be between 1 and 256." }
@@ -292,6 +305,18 @@ function Invoke-VisorCoreCommand {
                 if ($startupGb -le 0 -or $startupGb -gt 4096) { throw "Startup memory must be between 1 GB and 4096 GB." }
                 Set-VMMemory -VMName $targetName -StartupBytes ([int64]($startupGb * 1GB)) -ErrorAction Stop | Out-Null
                 $result.message = "VM '$targetName' startup memory set to $startupGb GB."
+            }
+            "vm.export" {
+                $path = [string] $options.path
+                if ([string]::IsNullOrWhiteSpace($path)) { throw "Export path is required." }
+                Export-VM -Name $targetName -Path $path -ErrorAction Stop | Out-Null
+                $result.message = "VM '$targetName' exported to '$path'."
+            }
+            "vm.move_storage" {
+                $path = [string] $options.path
+                if ([string]::IsNullOrWhiteSpace($path)) { throw "Destination storage path is required." }
+                Move-VMStorage -VMName $targetName -DestinationStoragePath $path -ErrorAction Stop | Out-Null
+                $result.message = "VM '$targetName' storage moved to '$path'."
             }
             "checkpoint.delete" {
                 $vmName = [string] $options.vm_name
@@ -316,6 +341,16 @@ function Invoke-VisorCoreCommand {
                 $notes = [string] $options.notes
                 Set-VMSwitch -Name $targetName -Notes $notes -ErrorAction Stop | Out-Null
                 $result.message = "Switch '$targetName' notes updated."
+            }
+            "disk.resize" {
+                $sizeGb = [double] $options.size_gb
+                if ($sizeGb -le 0 -or $sizeGb -gt 65536) { throw "Disk size must be between 1 GB and 65536 GB." }
+                Resize-VHD -Path $targetName -SizeBytes ([int64]($sizeGb * 1GB)) -ErrorAction Stop | Out-Null
+                $result.message = "Virtual disk resized to $sizeGb GB."
+            }
+            "disk.optimize" {
+                Optimize-VHD -Path $targetName -Mode Full -ErrorAction Stop | Out-Null
+                $result.message = "Virtual disk optimized."
             }
             default {
                 throw "Command action '$action' is not supported by this agent."

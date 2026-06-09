@@ -65,7 +65,7 @@ function ConvertTo-VisorCoreGb {
 
 function Get-VisorCoreInventory {
     $inventory = @{
-        agent_version = "0.3.0"
+        agent_version = "0.4.0"
         synced_at_utc = (Get-Date).ToUniversalTime().ToString("o")
         host = @{}
         vms = @()
@@ -333,13 +333,54 @@ function Invoke-VisorCoreCommand {
     return $result
 }
 
+function Invoke-VisorCoreCommandResponse {
+    param(
+        [string] $Portal,
+        [hashtable] $Payload,
+        $Response
+    )
+
+    if (-not $Response.commands) {
+        return
+    }
+
+    $commandResults = @()
+    foreach ($command in @($Response.commands)) {
+        $commandResult = Invoke-VisorCoreCommand -Command $command
+        $commandResults += $commandResult
+        Write-VisorCoreAgentLog ("command " + $commandResult.id + " " + $commandResult.status + ": " + $commandResult.message)
+    }
+
+    if (@($commandResults).Count -le 0) {
+        return
+    }
+
+    try {
+        $resultPayload = @{}
+        foreach ($key in $Payload.Keys) {
+            $resultPayload[$key] = $Payload[$key]
+        }
+        $resultPayload["inventory"] = Get-VisorCoreInventory
+        $resultPayload["command_results"] = $commandResults
+        $resultBody = $resultPayload | ConvertTo-Json -Depth 10
+        Invoke-RestMethod -Uri ($Portal.TrimEnd("/") + "/api/agent/checkin") -Method Post -Body $resultBody -ContentType "application/json" -UserAgent "curl/8.0" -ErrorAction Stop | Out-Null
+        Write-VisorCoreAgentLog "command results posted"
+    } catch {
+        Write-VisorCoreAgentLog ("command result post failed: " + $_.Exception.Message)
+    }
+}
+
 Write-VisorCoreAgentLog "scheduled task agent started"
+
+$inventorySyncSeconds = 60
+$commandPollSeconds = 2
+$lastInventorySyncUtc = [datetime]::MinValue
 
 while ($true) {
     try {
         if (-not (Test-Path $configPath)) {
             Write-VisorCoreAgentLog "config missing"
-            Start-Sleep -Seconds 60
+            Start-Sleep -Seconds 10
             continue
         }
 
@@ -349,8 +390,6 @@ while ($true) {
             $portal = "https://hyper.visorcore.com"
         }
 
-        $inventory = Get-VisorCoreInventory
-
         $payload = @{
             workspace = [string] $config.workspace
             region = [string] $config.region
@@ -359,33 +398,23 @@ while ($true) {
             hyperv_module_available = [bool] $config.hyperv_module_available
             require_mfa = [bool] $config.require_mfa
             service_status = "scheduled_task_running"
-            inventory = $inventory
         }
-        $body = $payload | ConvertTo-Json -Depth 10
 
-        $response = Invoke-RestMethod -Uri ($portal.TrimEnd("/") + "/api/agent/checkin") -Method Post -Body $body -ContentType "application/json" -UserAgent "curl/8.0" -ErrorAction Stop
-        Write-VisorCoreAgentLog "check-in ok"
+        $nowUtc = (Get-Date).ToUniversalTime()
+        $runInventorySync = (($nowUtc - $lastInventorySyncUtc).TotalSeconds -ge $inventorySyncSeconds)
 
-        if ($response.commands) {
-            $commandResults = @()
-            foreach ($command in @($response.commands)) {
-                $commandResult = Invoke-VisorCoreCommand -Command $command
-                $commandResults += $commandResult
-                Write-VisorCoreAgentLog ("command " + $commandResult.id + " " + $commandResult.status + ": " + $commandResult.message)
-            }
-            if (@($commandResults).Count -gt 0) {
-                try {
-                    $payload["inventory"] = Get-VisorCoreInventory
-                    $payload["command_results"] = $commandResults
-                    $resultBody = $payload | ConvertTo-Json -Depth 10
-                    Invoke-RestMethod -Uri ($portal.TrimEnd("/") + "/api/agent/checkin") -Method Post -Body $resultBody -ContentType "application/json" -UserAgent "curl/8.0" -ErrorAction Stop | Out-Null
-                    Write-VisorCoreAgentLog "command results posted"
-                    $payload.Remove("command_results")
-                } catch {
-                    Write-VisorCoreAgentLog ("command result post failed: " + $_.Exception.Message)
-                }
-            }
+        if ($runInventorySync) {
+            $payload["inventory"] = Get-VisorCoreInventory
+            $body = $payload | ConvertTo-Json -Depth 10
+            $response = Invoke-RestMethod -Uri ($portal.TrimEnd("/") + "/api/agent/checkin") -Method Post -Body $body -ContentType "application/json" -UserAgent "curl/8.0" -ErrorAction Stop
+            $lastInventorySyncUtc = $nowUtc
+            Write-VisorCoreAgentLog "check-in ok"
+        } else {
+            $body = $payload | ConvertTo-Json -Depth 5
+            $response = Invoke-RestMethod -Uri ($portal.TrimEnd("/") + "/api/agent/commands") -Method Post -Body $body -ContentType "application/json" -UserAgent "curl/8.0" -ErrorAction Stop
         }
+
+        Invoke-VisorCoreCommandResponse -Portal $portal -Payload $payload -Response $response
 
         if ($response.uninstall_service -eq $true -or $response.uninstall_agent -eq $true) {
             try {
@@ -407,7 +436,7 @@ while ($true) {
         Write-VisorCoreAgentLog ("check-in failed: " + $_.Exception.Message)
     }
 
-    Start-Sleep -Seconds 60
+    Start-Sleep -Seconds $commandPollSeconds
 }
 
 Write-VisorCoreAgentLog "scheduled task agent stopped"

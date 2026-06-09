@@ -63,11 +63,98 @@ function ConvertTo-VisorCoreGb {
     }
 }
 
+$script:VisorCoreConsoleSessions = @{}
+$script:VisorCoreLastConsoleFrames = @{}
+
+function Get-VisorCoreVmSystem {
+    param([string] $VmName)
+    return Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_ComputerSystem -ErrorAction Stop |
+        Where-Object { $_.ElementName -eq $VmName } |
+        Select-Object -First 1
+}
+
+function Get-VisorCoreVmKeyboard {
+    param([string] $VmName)
+    $vmSystem = Get-VisorCoreVmSystem -VmName $VmName
+    if ($null -eq $vmSystem) { throw "VM '$VmName' was not found for console input." }
+    $keyboard = $vmSystem.GetRelated("Msvm_Keyboard") | Select-Object -First 1
+    if ($null -eq $keyboard) { throw "Hyper-V keyboard channel was not available for VM '$VmName'." }
+    return $keyboard
+}
+
+function Send-VisorCoreVmConsoleText {
+    param(
+        [string] $VmName,
+        [string] $Text
+    )
+    if ([string]::IsNullOrEmpty($Text)) { return }
+    $keyboard = Get-VisorCoreVmKeyboard -VmName $VmName
+    $keyboard.TypeText($Text) | Out-Null
+}
+
+function Send-VisorCoreVmConsoleCtrlAltDel {
+    param([string] $VmName)
+    $keyboard = Get-VisorCoreVmKeyboard -VmName $VmName
+    $keyboard.TypeCtrlAltDel() | Out-Null
+}
+
+function Get-VisorCoreVmConsoleFrame {
+    param([string] $VmName)
+    Add-Type -AssemblyName "System.Drawing" -ErrorAction SilentlyContinue
+    $vmSystem = Get-VisorCoreVmSystem -VmName $VmName
+    if ($null -eq $vmSystem) { throw "VM '$VmName' was not found for console capture." }
+    $video = $vmSystem.GetRelated("Msvm_VideoHead") | Select-Object -First 1
+    $sourceWidth = 1024
+    $sourceHeight = 768
+    try {
+        if ($video -and $video.CurrentHorizontalResolution[0] -gt 0 -and $video.CurrentVerticalResolution[0] -gt 0) {
+            $sourceWidth = [int] $video.CurrentHorizontalResolution[0]
+            $sourceHeight = [int] $video.CurrentVerticalResolution[0]
+        }
+    } catch {}
+    $targetWidth = [Math]::Min($sourceWidth, 1280)
+    $targetHeight = [Math]::Max(1, [int] [Math]::Round(($sourceHeight / [double] $sourceWidth) * $targetWidth))
+    $vmms = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_VirtualSystemManagementService -ErrorAction Stop | Select-Object -First 1
+    $image = $vmms.GetVirtualSystemThumbnailImage($vmSystem, $targetWidth, $targetHeight).ImageData
+    if ($null -eq $image -or $image.Length -le 0) { throw "Hyper-V did not return a console frame for VM '$VmName'." }
+    $bitmap = New-Object System.Drawing.Bitmap -ArgumentList $targetWidth, $targetHeight, ([System.Drawing.Imaging.PixelFormat]::Format16bppRgb565)
+    $rect = New-Object System.Drawing.Rectangle 0, 0, $targetWidth, $targetHeight
+    $bmpData = $bitmap.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadWrite, [System.Drawing.Imaging.PixelFormat]::Format16bppRgb565)
+    try {
+        [System.Runtime.InteropServices.Marshal]::Copy($image, 0, $bmpData.Scan0, ($bmpData.Stride * $bmpData.Height))
+    } finally {
+        $bitmap.UnlockBits($bmpData)
+    }
+    $stream = New-Object System.IO.MemoryStream
+    try {
+        $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+        return @{
+            mime = "image/jpeg"
+            data = [Convert]::ToBase64String($stream.ToArray())
+            width = $targetWidth
+            height = $targetHeight
+            captured_at = (Get-Date).ToUniversalTime().ToString("o")
+        }
+    } finally {
+        $stream.Dispose()
+        $bitmap.Dispose()
+    }
+}
+
 function Get-VisorCoreInventory {
     $inventory = @{
-        agent_version = "0.8.0"
+        agent_version = "0.9.0"
         synced_at_utc = (Get-Date).ToUniversalTime().ToString("o")
         host = @{}
+        console = @{
+            installed = $true
+            enabled = $true
+            mode = "portal_relay"
+            display_capture = "hyperv_thumbnail"
+            keyboard_input = "msvm_keyboard"
+            transport = "outbound_tls_polling"
+            features = @("display_stream", "keyboard_text", "ctrl_alt_del", "audit_trail")
+        }
         storage = @{
             total_gb = 0
             free_gb = 0
@@ -366,6 +453,30 @@ Install-VisorCoreAgentTask -InstallRoot "$root" | Out-Null
                 Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy RemoteSigned -File `"$updaterPath`"" -WindowStyle Hidden
                 $result.message = "Hyper Agent update verified and launched from GitHub. The host will report the new version after the scheduled task restarts."
             }
+            "console.prepare" {
+                $sessionId = [string] $options.session_id
+                if ([string]::IsNullOrWhiteSpace($sessionId)) { throw "Console session ID is required." }
+                $expiresAt = [string] $options.expires_at
+                if ([string]::IsNullOrWhiteSpace($expiresAt)) {
+                    $expiresAt = (Get-Date).ToUniversalTime().AddMinutes(10).ToString("o")
+                }
+                try { Set-VMHost -EnableEnhancedSessionMode $true -ErrorAction SilentlyContinue | Out-Null } catch {}
+                $script:VisorCoreConsoleSessions[$sessionId] = @{
+                    session_id = $sessionId
+                    vm_name = $targetName
+                    expires_at = $expiresAt
+                }
+                $script:VisorCoreLastConsoleFrames[$sessionId] = [datetime]::MinValue
+                $result.message = "Console relay prepared for VM '$targetName'."
+            }
+            "console.type_text" {
+                Send-VisorCoreVmConsoleText -VmName $targetName -Text ([string] $options.text)
+                $result.message = "Console text sent to VM '$targetName'."
+            }
+            "console.ctrl_alt_del" {
+                Send-VisorCoreVmConsoleCtrlAltDel -VmName $targetName
+                $result.message = "Ctrl+Alt+Del sent to VM '$targetName'."
+            }
             "vm.start" {
                 Start-VM -Name $targetName -ErrorAction Stop | Out-Null
                 $result.message = "VM '$targetName' started."
@@ -528,6 +639,71 @@ function Invoke-VisorCoreCommandResponse {
     }
 }
 
+function Invoke-VisorCoreConsoleStreams {
+    param(
+        [string] $Portal,
+        [hashtable] $Payload
+    )
+
+    if ($script:VisorCoreConsoleSessions.Count -le 0) {
+        return
+    }
+
+    $nowUtc = (Get-Date).ToUniversalTime()
+    foreach ($sessionId in @($script:VisorCoreConsoleSessions.Keys)) {
+        $session = $script:VisorCoreConsoleSessions[$sessionId]
+        try {
+            $expires = [datetime] $session.expires_at
+            if ($expires.ToUniversalTime() -lt $nowUtc) {
+                $script:VisorCoreConsoleSessions.Remove($sessionId)
+                $script:VisorCoreLastConsoleFrames.Remove($sessionId)
+                continue
+            }
+        } catch {
+            $script:VisorCoreConsoleSessions.Remove($sessionId)
+            $script:VisorCoreLastConsoleFrames.Remove($sessionId)
+            continue
+        }
+
+        $lastFrame = [datetime]::MinValue
+        if ($script:VisorCoreLastConsoleFrames.ContainsKey($sessionId)) {
+            $lastFrame = [datetime] $script:VisorCoreLastConsoleFrames[$sessionId]
+        }
+        if (($nowUtc - $lastFrame).TotalMilliseconds -lt 900) {
+            continue
+        }
+        $script:VisorCoreLastConsoleFrames[$sessionId] = $nowUtc
+
+        $framePayload = @{}
+        foreach ($key in $Payload.Keys) {
+            $framePayload[$key] = $Payload[$key]
+        }
+        $framePayload["session_id"] = $sessionId
+        $framePayload["vm_name"] = [string] $session.vm_name
+
+        try {
+            $frame = Get-VisorCoreVmConsoleFrame -VmName ([string] $session.vm_name)
+            $framePayload["status"] = "streaming"
+            $framePayload["mime"] = $frame.mime
+            $framePayload["frame_data"] = $frame.data
+            $framePayload["width"] = $frame.width
+            $framePayload["height"] = $frame.height
+            $framePayload["captured_at"] = $frame.captured_at
+            $framePayload["message"] = "Console frame captured."
+        } catch {
+            $framePayload["status"] = "waiting"
+            $framePayload["message"] = $_.Exception.Message
+        }
+
+        try {
+            $frameBody = $framePayload | ConvertTo-Json -Depth 8
+            Invoke-RestMethod -Uri ($Portal.TrimEnd("/") + "/api/console-frame") -Method Post -Body $frameBody -ContentType "application/json" -UserAgent "curl/8.0" -ErrorAction Stop | Out-Null
+        } catch {
+            Write-VisorCoreAgentLog ("console frame post failed: " + $_.Exception.Message)
+        }
+    }
+}
+
 Write-VisorCoreAgentLog "scheduled task agent started"
 
 $inventorySyncSeconds = 10
@@ -573,6 +749,7 @@ while ($true) {
         }
 
         Invoke-VisorCoreCommandResponse -Portal $portal -Payload $payload -Response $response
+        Invoke-VisorCoreConsoleStreams -Portal $portal -Payload $payload
 
         if ($response.uninstall_service -eq $true -or $response.uninstall_agent -eq $true) {
             try {

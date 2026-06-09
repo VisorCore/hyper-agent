@@ -15,6 +15,20 @@ function Test-VisorCoreAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Test-VisorCoreInstallerPayload {
+    param([string] $Content)
+    if ([string]::IsNullOrWhiteSpace($Content)) {
+        return $false
+    }
+    $trimmed = $Content.TrimStart()
+    $htmlTag = "<" + "html"
+    $doctype = "<!" + "DOCTYPE"
+    if ($trimmed.StartsWith($htmlTag, [StringComparison]::OrdinalIgnoreCase) -or $trimmed.StartsWith($doctype, [StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    return $trimmed.StartsWith("# VisorCore Hyper bootstrap installer", [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Install-VisorCoreAgentTask {
     [CmdletBinding()]
     param(
@@ -436,7 +450,7 @@ function Invoke-VisorCoreCommand {
             "agent.update" {
                 $installerUri = "https://raw.githubusercontent.com/VisorCore/hyper-agent/main/install.ps1"
                 $installer = (Invoke-WebRequest -Uri $installerUri -UseBasicParsing -UserAgent "curl/8.0" -ErrorAction Stop).Content
-                if ($installer -match "<html|Bot Verification|grecaptcha") {
+                if (-not (Test-VisorCoreInstallerPayload -Content $installer)) {
                     throw "Installer download returned HTML instead of PowerShell."
                 }
                 [scriptblock]::Create($installer) | Out-Null
@@ -445,7 +459,10 @@ function Invoke-VisorCoreCommand {
 `$ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 `$installer = (Invoke-WebRequest -Uri "$installerUri" -UseBasicParsing -UserAgent "curl/8.0").Content
-if (`$installer -match "<html|Bot Verification|grecaptcha") { throw "Installer download returned HTML instead of PowerShell." }
+`$trimmed = `$installer.TrimStart()
+`$htmlTag = "<" + "html"
+`$doctype = "<!" + "DOCTYPE"
+if ([string]::IsNullOrWhiteSpace(`$installer) -or `$trimmed.StartsWith(`$htmlTag, [StringComparison]::OrdinalIgnoreCase) -or `$trimmed.StartsWith(`$doctype, [StringComparison]::OrdinalIgnoreCase)) { throw "Installer download returned HTML instead of PowerShell." }
 Invoke-Expression `$installer
 Install-VisorCoreAgentTask -InstallRoot "$root" | Out-Null
 "@

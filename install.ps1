@@ -177,7 +177,7 @@ function Get-VisorCoreVmConsoleFrame {
 
 function Get-VisorCoreInventory {
     $inventory = @{
-        agent_version = "0.9.1"
+        agent_version = "0.9.2"
         synced_at_utc = (Get-Date).ToUniversalTime().ToString("o")
         host = @{}
         console = @{
@@ -834,20 +834,29 @@ Write-VisorCoreAgentLog "scheduled task agent stopped"
         Write-Warning "Legacy VisorCore agent cleanup could not complete: $($_.Exception.Message)"
     }
 
-    try {
-        $existing = Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction SilentlyContinue
-        if ($existing) {
-            Stop-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction SilentlyContinue
-            Unregister-ScheduledTask -TaskPath $taskPath -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        }
-    } catch {}
-
     $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy RemoteSigned -File `"$agentPath`""
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
     Register-ScheduledTask -TaskName $taskName -TaskPath $taskPath -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-    Start-ScheduledTask -TaskName $taskName -TaskPath $taskPath
+
+    $restartTaskName = "Hyper Agent Restart"
+    $restartPath = Join-Path $InstallRoot "restart-agent.ps1"
+    $restartScript = @"
+`$ErrorActionPreference = "Continue"
+Start-Sleep -Seconds 4
+try { Stop-ScheduledTask -TaskPath "$taskPath" -TaskName "$taskName" -ErrorAction SilentlyContinue } catch {}
+Start-Sleep -Seconds 2
+try { Start-ScheduledTask -TaskPath "$taskPath" -TaskName "$taskName" -ErrorAction Stop } catch {}
+try { Unregister-ScheduledTask -TaskPath "$taskPath" -TaskName "$restartTaskName" -Confirm:`$false -ErrorAction SilentlyContinue } catch {}
+"@
+    Set-Content -Path $restartPath -Value $restartScript -Encoding UTF8
+    $restartAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy RemoteSigned -File `"$restartPath`""
+    $restartTrigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddSeconds(2))
+    $restartPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+    $restartSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Register-ScheduledTask -TaskName $restartTaskName -TaskPath $taskPath -Action $restartAction -Trigger $restartTrigger -Principal $restartPrincipal -Settings $restartSettings -Force | Out-Null
+    Start-ScheduledTask -TaskName $restartTaskName -TaskPath $taskPath -ErrorAction SilentlyContinue
 
     $task = Get-ScheduledTask -TaskName $taskName -TaskPath $taskPath
     return [PSCustomObject] @{

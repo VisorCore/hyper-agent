@@ -65,7 +65,7 @@ function ConvertTo-VisorCoreGb {
 
 function Get-VisorCoreInventory {
     $inventory = @{
-        agent_version = "0.6.0"
+        agent_version = "0.7.0"
         synced_at_utc = (Get-Date).ToUniversalTime().ToString("o")
         host = @{}
         storage = @{
@@ -510,8 +510,8 @@ function Invoke-VisorCoreCommandResponse {
 
 Write-VisorCoreAgentLog "scheduled task agent started"
 
-$inventorySyncSeconds = 60
-$commandPollSeconds = 2
+$inventorySyncSeconds = 10
+$commandPollSeconds = 1
 $lastInventorySyncUtc = [datetime]::MinValue
 
 while ($true) {
@@ -722,7 +722,7 @@ function Register-VisorCoreHost {
     }
     Write-Host ""
     Write-Host "Next step: return to VisorCore Hyper. A pending host approval should appear in the Hosts tab."
-    Write-Host "The background scheduled task checks in every 60 seconds. Secure token exchange and signed remote command execution will be handled by the next agent hardening release."
+    Write-Host "The background scheduled task checks inventory every 10 seconds, listens for commands every 1 second, and posts fresh inventory immediately after commands finish."
 
     return [PSCustomObject] $hostInfo
 }

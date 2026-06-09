@@ -65,7 +65,7 @@ function ConvertTo-VisorCoreGb {
 
 function Get-VisorCoreInventory {
     $inventory = @{
-        agent_version = "0.7.0"
+        agent_version = "0.8.0"
         synced_at_utc = (Get-Date).ToUniversalTime().ToString("o")
         host = @{}
         storage = @{
@@ -346,6 +346,26 @@ function Invoke-VisorCoreCommand {
         }
 
         switch ($action) {
+            "agent.update" {
+                $installerUri = "https://raw.githubusercontent.com/VisorCore/hyper-agent/main/install.ps1"
+                $installer = (Invoke-WebRequest -Uri $installerUri -UseBasicParsing -UserAgent "curl/8.0" -ErrorAction Stop).Content
+                if ($installer -match "<html|Bot Verification|grecaptcha") {
+                    throw "Installer download returned HTML instead of PowerShell."
+                }
+                [scriptblock]::Create($installer) | Out-Null
+                $updaterPath = Join-Path $root "update-agent.ps1"
+                $updater = @"
+`$ErrorActionPreference = "Stop"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+`$installer = (Invoke-WebRequest -Uri "$installerUri" -UseBasicParsing -UserAgent "curl/8.0").Content
+if (`$installer -match "<html|Bot Verification|grecaptcha") { throw "Installer download returned HTML instead of PowerShell." }
+Invoke-Expression `$installer
+Install-VisorCoreAgentTask -InstallRoot "$root" | Out-Null
+"@
+                Set-Content -Path $updaterPath -Value $updater -Encoding UTF8
+                Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy RemoteSigned -File `"$updaterPath`"" -WindowStyle Hidden
+                $result.message = "Hyper Agent update verified and launched from GitHub. The host will report the new version after the scheduled task restarts."
+            }
             "vm.start" {
                 Start-VM -Name $targetName -ErrorAction Stop | Out-Null
                 $result.message = "VM '$targetName' started."

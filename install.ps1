@@ -87,6 +87,21 @@ function Get-VisorCoreVmSystem {
         Select-Object -First 1
 }
 
+function Get-VisorCoreVmSettingData {
+    param([string] $VmName)
+    $vmSystem = Get-VisorCoreVmSystem -VmName $VmName
+    if ($null -eq $vmSystem) { throw "VM '$VmName' was not found for console capture." }
+    $settings = @($vmSystem.GetRelated("Msvm_VirtualSystemSettingData"))
+    $setting = $settings |
+        Where-Object { [string] $_.VirtualSystemIdentifier -eq [string] $vmSystem.Name -or [string] $_.ConfigurationID -eq [string] $vmSystem.Name } |
+        Select-Object -First 1
+    if ($null -eq $setting) {
+        $setting = $settings | Select-Object -First 1
+    }
+    if ($null -eq $setting) { throw "Hyper-V setting data was not available for VM '$VmName'." }
+    return $setting
+}
+
 function Get-VisorCoreVmKeyboard {
     param([string] $VmName)
     $vmSystem = Get-VisorCoreVmSystem -VmName $VmName
@@ -117,6 +132,7 @@ function Get-VisorCoreVmConsoleFrame {
     Add-Type -AssemblyName "System.Drawing" -ErrorAction SilentlyContinue
     $vmSystem = Get-VisorCoreVmSystem -VmName $VmName
     if ($null -eq $vmSystem) { throw "VM '$VmName' was not found for console capture." }
+    $vmSetting = Get-VisorCoreVmSettingData -VmName $VmName
     $video = $vmSystem.GetRelated("Msvm_VideoHead") | Select-Object -First 1
     $sourceWidth = 1024
     $sourceHeight = 768
@@ -129,7 +145,11 @@ function Get-VisorCoreVmConsoleFrame {
     $targetWidth = [Math]::Min($sourceWidth, 1280)
     $targetHeight = [Math]::Max(1, [int] [Math]::Round(($sourceHeight / [double] $sourceWidth) * $targetWidth))
     $vmms = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_VirtualSystemManagementService -ErrorAction Stop | Select-Object -First 1
-    $image = $vmms.GetVirtualSystemThumbnailImage($vmSystem, $targetWidth, $targetHeight).ImageData
+    $thumbnail = $vmms.GetVirtualSystemThumbnailImage($vmSetting, $targetWidth, $targetHeight)
+    if ($null -eq $thumbnail -or [int] $thumbnail.ReturnValue -ne 0) {
+        throw "Hyper-V thumbnail capture returned code $([int] $thumbnail.ReturnValue) for VM '$VmName'."
+    }
+    $image = $thumbnail.ImageData
     if ($null -eq $image -or $image.Length -le 0) { throw "Hyper-V did not return a console frame for VM '$VmName'." }
     $bitmap = New-Object System.Drawing.Bitmap -ArgumentList $targetWidth, $targetHeight, ([System.Drawing.Imaging.PixelFormat]::Format16bppRgb565)
     $rect = New-Object System.Drawing.Rectangle 0, 0, $targetWidth, $targetHeight
@@ -157,7 +177,7 @@ function Get-VisorCoreVmConsoleFrame {
 
 function Get-VisorCoreInventory {
     $inventory = @{
-        agent_version = "0.9.0"
+        agent_version = "0.9.1"
         synced_at_utc = (Get-Date).ToUniversalTime().ToString("o")
         host = @{}
         console = @{

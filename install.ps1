@@ -79,6 +79,8 @@ function ConvertTo-VisorCoreGb {
 
 $script:VisorCoreConsoleSessions = @{}
 $script:VisorCoreLastConsoleFrames = @{}
+$script:VisorCoreStreamSessionId = [guid]::NewGuid().ToString("N")
+$script:VisorCoreLastControlLatencyMs = 0
 
 function Get-VisorCoreVmSystem {
     param([string] $VmName)
@@ -177,7 +179,7 @@ function Get-VisorCoreVmConsoleFrame {
 
 function Get-VisorCoreInventory {
     $inventory = @{
-        agent_version = "0.9.3"
+        agent_version = "0.10.0"
         synced_at_utc = (Get-Date).ToUniversalTime().ToString("o")
         host = @{}
         console = @{
@@ -186,7 +188,7 @@ function Get-VisorCoreInventory {
             mode = "portal_relay"
             display_capture = "hyperv_thumbnail"
             keyboard_input = "msvm_keyboard"
-            transport = "outbound_tls_polling"
+            transport = "outbound_tls_long_poll"
             features = @("display_stream", "keyboard_text", "ctrl_alt_del", "audit_trail")
         }
         storage = @{
@@ -676,6 +678,36 @@ function Invoke-VisorCoreCommandResponse {
     }
 }
 
+function Invoke-VisorCoreControlPlane {
+    param(
+        [string] $Portal,
+        [hashtable] $Payload,
+        [int] $WaitSeconds = 25
+    )
+
+    $Payload["agent_version"] = "0.10.0"
+    $Payload["agent_transport"] = "outbound_tls_long_poll"
+    $Payload["stream_session_id"] = if ($script:VisorCoreStreamSessionId) { $script:VisorCoreStreamSessionId } else { "" }
+    $Payload["service_status"] = "live_stream_connected"
+
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $body = $Payload | ConvertTo-Json -Depth 6
+        $response = Invoke-RestMethod -Uri ($Portal.TrimEnd("/") + "/api/agent/stream?wait=$WaitSeconds") -Method Post -Body $body -ContentType "application/json" -UserAgent "curl/8.0" -TimeoutSec ($WaitSeconds + 10) -ErrorAction Stop
+        $timer.Stop()
+        $script:VisorCoreLastControlLatencyMs = [int] $timer.ElapsedMilliseconds
+        return $response
+    } catch {
+        $timer.Stop()
+        $script:VisorCoreLastControlLatencyMs = [int] $timer.ElapsedMilliseconds
+        Write-VisorCoreAgentLog ("live stream failed, using command poll: " + $_.Exception.Message)
+        $Payload["agent_transport"] = "outbound_tls_polling_fallback"
+        $Payload["service_status"] = "command_poll_fallback"
+        $body = $Payload | ConvertTo-Json -Depth 6
+        return Invoke-RestMethod -Uri ($Portal.TrimEnd("/") + "/api/agent/commands") -Method Post -Body $body -ContentType "application/json" -UserAgent "curl/8.0" -TimeoutSec 15 -ErrorAction Stop
+    }
+}
+
 function Invoke-VisorCoreConsoleStreams {
     param(
         [string] $Portal,
@@ -743,8 +775,9 @@ function Invoke-VisorCoreConsoleStreams {
 
 Write-VisorCoreAgentLog "scheduled task agent started"
 
-$inventorySyncSeconds = 10
-$commandPollSeconds = 1
+$inventorySyncSeconds = 8
+$idleStreamWaitSeconds = 15
+$consoleStreamWaitSeconds = 1
 $lastInventorySyncUtc = [datetime]::MinValue
 
 while ($true) {
@@ -769,10 +802,17 @@ while ($true) {
             hyperv_module_available = [bool] $config.hyperv_module_available
             require_mfa = [bool] $config.require_mfa
             service_status = "scheduled_task_running"
+            agent_version = "0.10.0"
+            agent_transport = "outbound_tls_long_poll"
+            stream_session_id = [string] $script:VisorCoreStreamSessionId
+            latency = @{
+                last_control_ms = [int] $script:VisorCoreLastControlLatencyMs
+            }
         }
 
         $nowUtc = (Get-Date).ToUniversalTime()
         $runInventorySync = (($nowUtc - $lastInventorySyncUtc).TotalSeconds -ge $inventorySyncSeconds)
+        $hasConsoleSessions = ($script:VisorCoreConsoleSessions.Count -gt 0)
 
         if ($runInventorySync) {
             $payload["inventory"] = Get-VisorCoreInventory
@@ -781,8 +821,8 @@ while ($true) {
             $lastInventorySyncUtc = $nowUtc
             Write-VisorCoreAgentLog "check-in ok"
         } else {
-            $body = $payload | ConvertTo-Json -Depth 5
-            $response = Invoke-RestMethod -Uri ($portal.TrimEnd("/") + "/api/agent/commands") -Method Post -Body $body -ContentType "application/json" -UserAgent "curl/8.0" -ErrorAction Stop
+            $waitSeconds = if ($hasConsoleSessions) { $consoleStreamWaitSeconds } else { $idleStreamWaitSeconds }
+            $response = Invoke-VisorCoreControlPlane -Portal $portal -Payload $payload -WaitSeconds $waitSeconds
         }
 
         Invoke-VisorCoreCommandResponse -Portal $portal -Payload $payload -Response $response
@@ -808,7 +848,11 @@ while ($true) {
         Write-VisorCoreAgentLog ("check-in failed: " + $_.Exception.Message)
     }
 
-    Start-Sleep -Seconds $commandPollSeconds
+    if ($script:VisorCoreConsoleSessions.Count -gt 0) {
+        Start-Sleep -Milliseconds 150
+    } else {
+        Start-Sleep -Milliseconds 200
+    }
 }
 
 Write-VisorCoreAgentLog "scheduled task agent stopped"
@@ -862,10 +906,10 @@ try {
     Start-ScheduledTask -TaskPath `$taskPath -TaskName `$taskName -ErrorAction Stop
     `$state = "Unknown"
     try { `$state = (Get-ScheduledTask -TaskPath `$taskPath -TaskName `$taskName -ErrorAction Stop).State } catch {}
-    @{ success = `$true; version = "0.9.3"; state = [string] `$state; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
+    @{ success = `$true; version = "0.10.0"; state = [string] `$state; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
     Write-ApplyLog ("main task started: " + `$state)
 } catch {
-    @{ success = `$false; version = "0.9.3"; message = `$_.Exception.Message; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
+    @{ success = `$false; version = "0.10.0"; message = `$_.Exception.Message; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
     Write-ApplyLog ("apply failed: " + `$_.Exception.Message)
 }
 try { Unregister-ScheduledTask -TaskPath `$taskPath -TaskName `$applyTaskName -Confirm:`$false -ErrorAction SilentlyContinue } catch {}

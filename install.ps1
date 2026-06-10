@@ -119,6 +119,35 @@ function Get-VisorCoreVmKeyboard {
     return $keyboard
 }
 
+function Get-VisorCoreVmMouse {
+    param([string] $VmName)
+    $vmSystem = Get-VisorCoreVmSystem -VmName $VmName
+    if ($null -eq $vmSystem) { throw "VM '$VmName' was not found for console mouse input." }
+    $mouse = $vmSystem.GetRelated("Msvm_SyntheticMouse") | Select-Object -First 1
+    if ($null -eq $mouse) {
+        $mouse = $vmSystem.GetRelated("Msvm_Ps2Mouse") | Select-Object -First 1
+    }
+    if ($null -eq $mouse) { throw "Hyper-V mouse channel was not available for VM '$VmName'." }
+    return $mouse
+}
+
+function Assert-VisorCoreWmiReturn {
+    param(
+        $ReturnValue,
+        [string] $Action
+    )
+    $code = 0
+    if ($null -eq $ReturnValue) { return }
+    if ($ReturnValue.PSObject.Properties.Name -contains "ReturnValue") {
+        $code = [int] $ReturnValue.ReturnValue
+    } else {
+        $code = [int] $ReturnValue
+    }
+    if ($code -ne 0 -and $code -ne 4096) {
+        throw "$Action returned Hyper-V code $code."
+    }
+}
+
 function Send-VisorCoreVmConsoleText {
     param(
         [string] $VmName,
@@ -129,10 +158,53 @@ function Send-VisorCoreVmConsoleText {
     $keyboard.TypeText($Text) | Out-Null
 }
 
+function Send-VisorCoreVmConsoleKey {
+    param(
+        [string] $VmName,
+        [int] $KeyCode
+    )
+    if ($KeyCode -le 0) { throw "Console key code is required." }
+    $keyboard = Get-VisorCoreVmKeyboard -VmName $VmName
+    $result = $keyboard.TypeKey($KeyCode)
+    Assert-VisorCoreWmiReturn -ReturnValue $result -Action "Console key press"
+}
+
 function Send-VisorCoreVmConsoleCtrlAltDel {
     param([string] $VmName)
     $keyboard = Get-VisorCoreVmKeyboard -VmName $VmName
     $keyboard.TypeCtrlAltDel() | Out-Null
+}
+
+function Send-VisorCoreVmConsoleMouse {
+    param(
+        [string] $VmName,
+        [int] $X,
+        [int] $Y,
+        [string] $Button = "left",
+        [string] $MouseAction = "click"
+    )
+    if ($X -lt 0 -or $Y -lt 0) { throw "Console mouse coordinates are invalid." }
+    $mouse = Get-VisorCoreVmMouse -VmName $VmName
+    $move = $mouse.SetAbsolutePosition($X, $Y)
+    Assert-VisorCoreWmiReturn -ReturnValue $move -Action "Console mouse move"
+    if ([string]::IsNullOrWhiteSpace($MouseAction) -or $MouseAction -eq "move") { return }
+    if ([string]::IsNullOrWhiteSpace($Button)) { $Button = "left" }
+    $buttonIndex = 1
+    switch ($Button.ToLowerInvariant()) {
+        "right" { $buttonIndex = 2 }
+        "middle" { $buttonIndex = 3 }
+        default { $buttonIndex = 1 }
+    }
+    if ($MouseAction -eq "down") {
+        $down = $mouse.SetButtonState($buttonIndex, $true)
+        Assert-VisorCoreWmiReturn -ReturnValue $down -Action "Console mouse button down"
+    } elseif ($MouseAction -eq "up") {
+        $up = $mouse.SetButtonState($buttonIndex, $false)
+        Assert-VisorCoreWmiReturn -ReturnValue $up -Action "Console mouse button up"
+    } else {
+        $click = $mouse.ClickButton($buttonIndex)
+        Assert-VisorCoreWmiReturn -ReturnValue $click -Action "Console mouse click"
+    }
 }
 
 function Get-VisorCoreVmConsoleFrame {
@@ -185,7 +257,7 @@ function Get-VisorCoreVmConsoleFrame {
 
 function Get-VisorCoreInventory {
     $inventory = @{
-        agent_version = "0.11.0"
+        agent_version = "0.12.0"
         synced_at_utc = (Get-Date).ToUniversalTime().ToString("o")
         host = @{}
         console = @{
@@ -195,7 +267,7 @@ function Get-VisorCoreInventory {
             display_capture = "hyperv_thumbnail"
             keyboard_input = "msvm_keyboard"
             transport = "outbound_tls_long_poll"
-            features = @("display_stream", "keyboard_text", "ctrl_alt_del", "audit_trail")
+            features = @("display_stream", "keyboard_text", "special_keys", "mouse_click", "ctrl_alt_del", "audit_trail")
         }
         storage = @{
             total_gb = 0
@@ -518,6 +590,14 @@ Install-VisorCoreAgentTask -InstallRoot "$root" | Out-Null
                 Send-VisorCoreVmConsoleText -VmName $targetName -Text ([string] $options.text)
                 $result.message = "Console text sent to VM '$targetName'."
             }
+            "console.key" {
+                Send-VisorCoreVmConsoleKey -VmName $targetName -KeyCode ([int] $options.key_code)
+                $result.message = "Console key sent to VM '$targetName'."
+            }
+            "console.mouse" {
+                Send-VisorCoreVmConsoleMouse -VmName $targetName -X ([int] $options.x) -Y ([int] $options.y) -Button ([string] $options.button) -MouseAction ([string] $options.mouse_action)
+                $result.message = "Console mouse input sent to VM '$targetName'."
+            }
             "console.ctrl_alt_del" {
                 Send-VisorCoreVmConsoleCtrlAltDel -VmName $targetName
                 $result.message = "Ctrl+Alt+Del sent to VM '$targetName'."
@@ -681,6 +761,30 @@ function Invoke-VisorCoreCommandResponse {
     } catch {
         Write-VisorCoreAgentLog ("command result post failed: " + $_.Exception.Message)
     }
+
+    $shouldRefreshInventory = $false
+    foreach ($commandResult in @($commandResults)) {
+        $commandAction = [string] $commandResult.action
+        if ($commandResult.success -eq $true -and -not $commandAction.StartsWith("console.") -and $commandAction -ne "agent.update") {
+            $shouldRefreshInventory = $true
+            break
+        }
+    }
+
+    if ($shouldRefreshInventory) {
+        try {
+            $inventoryPayload = @{}
+            foreach ($key in $Payload.Keys) {
+                $inventoryPayload[$key] = $Payload[$key]
+            }
+            $inventoryPayload["inventory"] = Get-VisorCoreInventory
+            $inventoryBody = $inventoryPayload | ConvertTo-Json -Depth 10
+            Invoke-RestMethod -Uri ($Portal.TrimEnd("/") + "/api/agent/checkin") -Method Post -Body $inventoryBody -ContentType "application/json" -UserAgent "curl/8.0" -TimeoutSec 30 -ErrorAction Stop | Out-Null
+            Write-VisorCoreAgentLog "post-command inventory check-in ok"
+        } catch {
+            Write-VisorCoreAgentLog ("post-command inventory check-in failed: " + $_.Exception.Message)
+        }
+    }
 }
 
 function Invoke-VisorCoreControlPlane {
@@ -690,7 +794,7 @@ function Invoke-VisorCoreControlPlane {
         [int] $WaitSeconds = 25
     )
 
-    $Payload["agent_version"] = "0.11.0"
+    $Payload["agent_version"] = "0.12.0"
     $Payload["agent_transport"] = "outbound_tls_long_poll"
     $Payload["stream_session_id"] = if ($script:VisorCoreStreamSessionId) { $script:VisorCoreStreamSessionId } else { "" }
     $Payload["service_status"] = "live_stream_connected"
@@ -743,7 +847,7 @@ function Invoke-VisorCoreConsoleStreams {
         if ($script:VisorCoreLastConsoleFrames.ContainsKey($sessionId)) {
             $lastFrame = [datetime] $script:VisorCoreLastConsoleFrames[$sessionId]
         }
-        if (($nowUtc - $lastFrame).TotalMilliseconds -lt 900) {
+        if (($nowUtc - $lastFrame).TotalMilliseconds -lt 550) {
             continue
         }
         $script:VisorCoreLastConsoleFrames[$sessionId] = $nowUtc
@@ -788,7 +892,7 @@ function New-VisorCoreBasePayload {
         hyperv_module_available = [bool] $Config.hyperv_module_available
         require_mfa = [bool] $Config.require_mfa
         service_status = if ($Mode -eq "Inventory") { "inventory_task_running" } else { "control_stream_running" }
-        agent_version = "0.11.0"
+        agent_version = "0.12.0"
         agent_transport = "outbound_tls_long_poll"
         stream_session_id = [string] $script:VisorCoreStreamSessionId
         latency = @{
@@ -799,7 +903,7 @@ function New-VisorCoreBasePayload {
 
 Write-VisorCoreAgentLog ("scheduled task agent started mode=" + $Mode)
 
-$inventorySyncSeconds = 6
+$inventorySyncSeconds = 3
 $idleStreamWaitSeconds = 20
 $consoleStreamWaitSeconds = 1
 
@@ -936,10 +1040,10 @@ try {
     `$inventoryState = "Unknown"
     try { `$state = (Get-ScheduledTask -TaskPath `$taskPath -TaskName `$taskName -ErrorAction Stop).State } catch {}
     try { `$inventoryState = (Get-ScheduledTask -TaskPath `$taskPath -TaskName `$inventoryTaskName -ErrorAction Stop).State } catch {}
-    @{ success = `$true; version = "0.11.0"; state = [string] `$state; inventory_state = [string] `$inventoryState; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
+    @{ success = `$true; version = "0.12.0"; state = [string] `$state; inventory_state = [string] `$inventoryState; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
     Write-ApplyLog ("tasks started: control=" + `$state + " inventory=" + `$inventoryState)
 } catch {
-    @{ success = `$false; version = "0.11.0"; message = `$_.Exception.Message; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
+    @{ success = `$false; version = "0.12.0"; message = `$_.Exception.Message; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
     Write-ApplyLog ("apply failed: " + `$_.Exception.Message)
 }
 try { Unregister-ScheduledTask -TaskPath `$taskPath -TaskName `$applyTaskName -Confirm:`$false -ErrorAction SilentlyContinue } catch {}

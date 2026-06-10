@@ -1,0 +1,33 @@
+name: Build Windows Agent
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Restore
+        run: dotnet restore src/VisorCore.HyperAgent/VisorCore.HyperAgent.csproj
+      - name: Publish
+        run: dotnet publish src/VisorCore.HyperAgent/VisorCore.HyperAgent.csproj -c Release -o artifacts/windows-agent
+      - name: Sign binary
+        if: ${{ env.WINDOWS_CODE_SIGNING_CERT_BASE64 != '' }}
+        shell: pwsh
+        env:
+          WINDOWS_CODE_SIGNING_CERT_BASE64: ${{ secrets.WINDOWS_CODE_SIGNING_CERT_BASE64 }}
+          WINDOWS_CODE_SIGNING_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGNING_PASSWORD }}
+        run: |
+          $certPath = "$env:RUNNER_TEMP\visorcore-codesign.pfx"
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CODE_SIGNING_CERT_BASE64))
+          & signtool sign /f $certPath /p "$env:WINDOWS_CODE_SIGNING_PASSWORD" /tr http://timestamp.digicert.com /td sha256 /fd sha256 artifacts/windows-agent/VisorCore.HyperAgent.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: visorcore-hyper-agent-windows-x64
+          path: artifacts/windows-agent

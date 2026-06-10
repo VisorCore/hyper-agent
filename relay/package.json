@@ -1,0 +1,16 @@
+{
+  "name": "@visorcore/console-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "VisorCore outbound console WebSocket relay",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.17.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

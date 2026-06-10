@@ -37,11 +37,17 @@ function Install-VisorCoreAgentTask {
     )
 
     $taskName = "Hyper Agent"
+    $inventoryTaskName = "Hyper Agent Inventory"
     $taskPath = "\VisorCore\"
     $agentPath = Join-Path $InstallRoot "agent.ps1"
     $logPath = Join-Path $InstallRoot "agent.log"
 
     $agentScript = @'
+param(
+    [ValidateSet("Control", "Inventory")]
+    [string] $Mode = "Control"
+)
+
 $ErrorActionPreference = "Continue"
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -179,7 +185,7 @@ function Get-VisorCoreVmConsoleFrame {
 
 function Get-VisorCoreInventory {
     $inventory = @{
-        agent_version = "0.10.0"
+        agent_version = "0.11.0"
         synced_at_utc = (Get-Date).ToUniversalTime().ToString("o")
         host = @{}
         console = @{
@@ -668,9 +674,8 @@ function Invoke-VisorCoreCommandResponse {
         foreach ($key in $Payload.Keys) {
             $resultPayload[$key] = $Payload[$key]
         }
-        $resultPayload["inventory"] = Get-VisorCoreInventory
         $resultPayload["command_results"] = $commandResults
-        $resultBody = $resultPayload | ConvertTo-Json -Depth 10
+        $resultBody = $resultPayload | ConvertTo-Json -Depth 8
         Invoke-RestMethod -Uri ($Portal.TrimEnd("/") + "/api/agent/checkin") -Method Post -Body $resultBody -ContentType "application/json" -UserAgent "curl/8.0" -ErrorAction Stop | Out-Null
         Write-VisorCoreAgentLog "command results posted"
     } catch {
@@ -685,7 +690,7 @@ function Invoke-VisorCoreControlPlane {
         [int] $WaitSeconds = 25
     )
 
-    $Payload["agent_version"] = "0.10.0"
+    $Payload["agent_version"] = "0.11.0"
     $Payload["agent_transport"] = "outbound_tls_long_poll"
     $Payload["stream_session_id"] = if ($script:VisorCoreStreamSessionId) { $script:VisorCoreStreamSessionId } else { "" }
     $Payload["service_status"] = "live_stream_connected"
@@ -773,85 +778,102 @@ function Invoke-VisorCoreConsoleStreams {
     }
 }
 
-Write-VisorCoreAgentLog "scheduled task agent started"
+function New-VisorCoreBasePayload {
+    param($Config)
+    return @{
+        workspace = [string] $Config.workspace
+        region = [string] $Config.region
+        computer_name = [string] $Config.computer_name
+        user_name = [string] $Config.user_name
+        hyperv_module_available = [bool] $Config.hyperv_module_available
+        require_mfa = [bool] $Config.require_mfa
+        service_status = if ($Mode -eq "Inventory") { "inventory_task_running" } else { "control_stream_running" }
+        agent_version = "0.11.0"
+        agent_transport = "outbound_tls_long_poll"
+        stream_session_id = [string] $script:VisorCoreStreamSessionId
+        latency = @{
+            last_control_ms = [int] $script:VisorCoreLastControlLatencyMs
+        }
+    }
+}
 
-$inventorySyncSeconds = 8
-$idleStreamWaitSeconds = 15
+Write-VisorCoreAgentLog ("scheduled task agent started mode=" + $Mode)
+
+$inventorySyncSeconds = 6
+$idleStreamWaitSeconds = 20
 $consoleStreamWaitSeconds = 1
-$lastInventorySyncUtc = [datetime]::MinValue
 
-while ($true) {
-    try {
-        if (-not (Test-Path $configPath)) {
-            Write-VisorCoreAgentLog "config missing"
-            Start-Sleep -Seconds 10
-            continue
-        }
-
-        $config = Get-Content -Path $configPath -Raw | ConvertFrom-Json
-        $portal = [string] $config.portal
-        if ([string]::IsNullOrWhiteSpace($portal)) {
-            $portal = "https://hyper.visorcore.com"
-        }
-
-        $payload = @{
-            workspace = [string] $config.workspace
-            region = [string] $config.region
-            computer_name = [string] $config.computer_name
-            user_name = [string] $config.user_name
-            hyperv_module_available = [bool] $config.hyperv_module_available
-            require_mfa = [bool] $config.require_mfa
-            service_status = "scheduled_task_running"
-            agent_version = "0.10.0"
-            agent_transport = "outbound_tls_long_poll"
-            stream_session_id = [string] $script:VisorCoreStreamSessionId
-            latency = @{
-                last_control_ms = [int] $script:VisorCoreLastControlLatencyMs
+if ($Mode -eq "Inventory") {
+    while ($true) {
+        try {
+            if (-not (Test-Path $configPath)) {
+                Write-VisorCoreAgentLog "inventory config missing"
+                Start-Sleep -Seconds 10
+                continue
             }
-        }
-
-        $nowUtc = (Get-Date).ToUniversalTime()
-        $runInventorySync = (($nowUtc - $lastInventorySyncUtc).TotalSeconds -ge $inventorySyncSeconds)
-        $hasConsoleSessions = ($script:VisorCoreConsoleSessions.Count -gt 0)
-
-        if ($runInventorySync) {
+            $config = Get-Content -Path $configPath -Raw | ConvertFrom-Json
+            $portal = [string] $config.portal
+            if ([string]::IsNullOrWhiteSpace($portal)) {
+                $portal = "https://hyper.visorcore.com"
+            }
+            $payload = New-VisorCoreBasePayload -Config $config
             $payload["inventory"] = Get-VisorCoreInventory
             $body = $payload | ConvertTo-Json -Depth 10
-            $response = Invoke-RestMethod -Uri ($portal.TrimEnd("/") + "/api/agent/checkin") -Method Post -Body $body -ContentType "application/json" -UserAgent "curl/8.0" -ErrorAction Stop
-            $lastInventorySyncUtc = $nowUtc
-            Write-VisorCoreAgentLog "check-in ok"
-        } else {
+            Invoke-RestMethod -Uri ($portal.TrimEnd("/") + "/api/agent/checkin") -Method Post -Body $body -ContentType "application/json" -UserAgent "curl/8.0" -TimeoutSec 30 -ErrorAction Stop | Out-Null
+            Write-VisorCoreAgentLog "inventory check-in ok"
+        } catch {
+            Write-VisorCoreAgentLog ("inventory check-in failed: " + $_.Exception.Message)
+        }
+        Start-Sleep -Seconds $inventorySyncSeconds
+    }
+} else {
+    while ($true) {
+        try {
+            if (-not (Test-Path $configPath)) {
+                Write-VisorCoreAgentLog "control config missing"
+                Start-Sleep -Seconds 10
+                continue
+            }
+
+            $config = Get-Content -Path $configPath -Raw | ConvertFrom-Json
+            $portal = [string] $config.portal
+            if ([string]::IsNullOrWhiteSpace($portal)) {
+                $portal = "https://hyper.visorcore.com"
+            }
+
+            $payload = New-VisorCoreBasePayload -Config $config
+            $hasConsoleSessions = ($script:VisorCoreConsoleSessions.Count -gt 0)
             $waitSeconds = if ($hasConsoleSessions) { $consoleStreamWaitSeconds } else { $idleStreamWaitSeconds }
             $response = Invoke-VisorCoreControlPlane -Portal $portal -Payload $payload -WaitSeconds $waitSeconds
-        }
 
-        Invoke-VisorCoreCommandResponse -Portal $portal -Payload $payload -Response $response
-        Invoke-VisorCoreConsoleStreams -Portal $portal -Payload $payload
+            Invoke-VisorCoreCommandResponse -Portal $portal -Payload $payload -Response $response
+            Invoke-VisorCoreConsoleStreams -Portal $portal -Payload $payload
 
-        if ($response.uninstall_service -eq $true -or $response.uninstall_agent -eq $true) {
-            try {
-                $payload.service_status = "removed"
-                $payload.uninstall_confirmed = $true
-                $finalBody = $payload | ConvertTo-Json -Depth 10
-                Invoke-RestMethod -Uri ($portal.TrimEnd("/") + "/api/agent/checkin") -Method Post -Body $finalBody -ContentType "application/json" -UserAgent "curl/8.0" -ErrorAction Stop | Out-Null
-                Write-VisorCoreAgentLog "uninstall confirmation sent"
-            } catch {
-                Write-VisorCoreAgentLog ("uninstall confirmation failed: " + $_.Exception.Message)
+            if ($response.uninstall_service -eq $true -or $response.uninstall_agent -eq $true) {
+                try {
+                    $payload.service_status = "removed"
+                    $payload.uninstall_confirmed = $true
+                    $finalBody = $payload | ConvertTo-Json -Depth 8
+                    Invoke-RestMethod -Uri ($portal.TrimEnd("/") + "/api/agent/checkin") -Method Post -Body $finalBody -ContentType "application/json" -UserAgent "curl/8.0" -TimeoutSec 15 -ErrorAction Stop | Out-Null
+                    Write-VisorCoreAgentLog "uninstall confirmation sent"
+                } catch {
+                    Write-VisorCoreAgentLog ("uninstall confirmation failed: " + $_.Exception.Message)
+                }
+                Write-VisorCoreAgentLog "uninstall requested; unregistering scheduled tasks"
+                try { Unregister-ScheduledTask -TaskPath "\VisorCore\" -TaskName "Hyper Agent" -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+                try { Unregister-ScheduledTask -TaskPath "\VisorCore\" -TaskName "Hyper Agent Inventory" -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+                break
             }
-            Write-VisorCoreAgentLog "uninstall requested; unregistering scheduled task"
-            try {
-                Unregister-ScheduledTask -TaskPath "\VisorCore\" -TaskName "Hyper Agent" -Confirm:$false -ErrorAction SilentlyContinue
-            } catch {}
-            break
+        } catch {
+            Write-VisorCoreAgentLog ("control stream failed: " + $_.Exception.Message)
+            Start-Sleep -Seconds 2
         }
-    } catch {
-        Write-VisorCoreAgentLog ("check-in failed: " + $_.Exception.Message)
-    }
 
-    if ($script:VisorCoreConsoleSessions.Count -gt 0) {
-        Start-Sleep -Milliseconds 150
-    } else {
-        Start-Sleep -Milliseconds 200
+        if ($script:VisorCoreConsoleSessions.Count -gt 0) {
+            Start-Sleep -Milliseconds 100
+        } else {
+            Start-Sleep -Milliseconds 100
+        }
     }
 }
 
@@ -884,6 +906,7 @@ Write-VisorCoreAgentLog "scheduled task agent stopped"
     $applyScript = @"
 `$ErrorActionPreference = "Continue"
 `$taskName = "$taskName"
+`$inventoryTaskName = "$inventoryTaskName"
 `$taskPath = "$taskPath"
 `$applyTaskName = "$applyTaskName"
 `$logPath = "$logPath"
@@ -895,21 +918,28 @@ function Write-ApplyLog {
 Write-ApplyLog "apply task started"
 Start-Sleep -Seconds 3
 try { Stop-ScheduledTask -TaskPath `$taskPath -TaskName `$taskName -ErrorAction SilentlyContinue } catch { Write-ApplyLog ("stop failed: " + `$_.Exception.Message) }
+try { Stop-ScheduledTask -TaskPath `$taskPath -TaskName `$inventoryTaskName -ErrorAction SilentlyContinue } catch { Write-ApplyLog ("inventory stop failed: " + `$_.Exception.Message) }
 Start-Sleep -Seconds 1
 try { Unregister-ScheduledTask -TaskPath `$taskPath -TaskName `$taskName -Confirm:`$false -ErrorAction SilentlyContinue } catch { Write-ApplyLog ("unregister failed: " + `$_.Exception.Message) }
+try { Unregister-ScheduledTask -TaskPath `$taskPath -TaskName `$inventoryTaskName -Confirm:`$false -ErrorAction SilentlyContinue } catch { Write-ApplyLog ("inventory unregister failed: " + `$_.Exception.Message) }
 try {
-    `$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-NoProfile -ExecutionPolicy RemoteSigned -File "$agentPath"'
+    `$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-NoProfile -ExecutionPolicy RemoteSigned -File "$agentPath" -Mode Control'
+    `$inventoryAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-NoProfile -ExecutionPolicy RemoteSigned -File "$agentPath" -Mode Inventory'
     `$trigger = New-ScheduledTaskTrigger -AtStartup
     `$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
     `$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
     Register-ScheduledTask -TaskName `$taskName -TaskPath `$taskPath -Action `$action -Trigger `$trigger -Principal `$principal -Settings `$settings -Force | Out-Null
+    Register-ScheduledTask -TaskName `$inventoryTaskName -TaskPath `$taskPath -Action `$inventoryAction -Trigger `$trigger -Principal `$principal -Settings `$settings -Force | Out-Null
     Start-ScheduledTask -TaskPath `$taskPath -TaskName `$taskName -ErrorAction Stop
+    Start-ScheduledTask -TaskPath `$taskPath -TaskName `$inventoryTaskName -ErrorAction Stop
     `$state = "Unknown"
+    `$inventoryState = "Unknown"
     try { `$state = (Get-ScheduledTask -TaskPath `$taskPath -TaskName `$taskName -ErrorAction Stop).State } catch {}
-    @{ success = `$true; version = "0.10.0"; state = [string] `$state; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
-    Write-ApplyLog ("main task started: " + `$state)
+    try { `$inventoryState = (Get-ScheduledTask -TaskPath `$taskPath -TaskName `$inventoryTaskName -ErrorAction Stop).State } catch {}
+    @{ success = `$true; version = "0.11.0"; state = [string] `$state; inventory_state = [string] `$inventoryState; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
+    Write-ApplyLog ("tasks started: control=" + `$state + " inventory=" + `$inventoryState)
 } catch {
-    @{ success = `$false; version = "0.10.0"; message = `$_.Exception.Message; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
+    @{ success = `$false; version = "0.11.0"; message = `$_.Exception.Message; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
     Write-ApplyLog ("apply failed: " + `$_.Exception.Message)
 }
 try { Unregister-ScheduledTask -TaskPath `$taskPath -TaskName `$applyTaskName -Confirm:`$false -ErrorAction SilentlyContinue } catch {}
@@ -923,13 +953,17 @@ try { Unregister-ScheduledTask -TaskPath `$taskPath -TaskName `$applyTaskName -C
     Start-ScheduledTask -TaskName $applyTaskName -TaskPath $taskPath -ErrorAction Stop
 
     $task = $null
+    $inventoryTask = $null
     try { $task = Get-ScheduledTask -TaskName $taskName -TaskPath $taskPath -ErrorAction Stop } catch {}
+    try { $inventoryTask = Get-ScheduledTask -TaskName $inventoryTaskName -TaskPath $taskPath -ErrorAction Stop } catch {}
     return [PSCustomObject] @{
         TaskName = $taskName
+        InventoryTaskName = $inventoryTaskName
         TaskPath = $taskPath
         Script = $agentPath
         Log = $logPath
         State = if ($null -ne $task) { $task.State } else { "UpdateQueued" }
+        InventoryState = if ($null -ne $inventoryTask) { $inventoryTask.State } else { "UpdateQueued" }
     }
 }
 
@@ -1022,7 +1056,8 @@ function Register-VisorCoreHost {
         Write-Host "Hyper-V PowerShell module: not detected on this host" -ForegroundColor Yellow
     }
     if ($null -ne $taskInfo) {
-        Write-Host "Agent scheduled task: $($taskInfo.TaskPath)$($taskInfo.TaskName) $($taskInfo.State)" -ForegroundColor Green
+        Write-Host "Agent control task: $($taskInfo.TaskPath)$($taskInfo.TaskName) $($taskInfo.State)" -ForegroundColor Green
+        Write-Host "Agent inventory task: $($taskInfo.TaskPath)$($taskInfo.InventoryTaskName) $($taskInfo.InventoryState)" -ForegroundColor Green
         Write-Host "Agent script: $($taskInfo.Script)"
         Write-Host "Agent log: $($taskInfo.Log)"
     } else {

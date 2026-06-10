@@ -1030,7 +1030,7 @@ function Register-VisorCoreHost {
     }
     Write-Host ""
     Write-Host "Next step: return to VisorCore Hyper. A pending host approval should appear in the Hosts tab."
-    Write-Host "The background scheduled task checks inventory every 10 seconds, listens for commands every 1 second, and posts fresh inventory immediately after commands finish."
+    Write-Host "The background scheduled task keeps a persistent outbound command stream open, refreshes inventory frequently, and posts fresh inventory immediately after commands finish."
 
     return [PSCustomObject] $hostInfo
 }

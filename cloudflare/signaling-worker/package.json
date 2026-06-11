@@ -1,0 +1,13 @@
+{
+  "name": "@visorcore/console-signaling-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Workers Durable Object signaling service for VisorCore WebRTC console sessions",
+  "type": "module",
+  "scripts": {
+    "check": "node --check src/worker.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

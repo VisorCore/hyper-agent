@@ -1,6 +1,6 @@
 # VisorCore Enterprise Console Gateway Protocol
 
-The PowerShell thumbnail console is a legacy fallback. Production console sessions use a signed Windows service on the Hyper-V host and an outbound WebSocket relay.
+The PowerShell thumbnail console is a legacy fallback. Production console sessions use a signed Windows service on the Hyper-V host, Cloudflare Workers Durable Objects for WebRTC signaling, and direct browser-to-agent media whenever possible.
 
 ## Goals
 
@@ -12,10 +12,11 @@ The PowerShell thumbnail console is a legacy fallback. Production console sessio
 
 ## Transport
 
-- Agent connects outbound to `wss://relay.hyper.visorcore.com/agent`.
-- Browser connects to `wss://relay.hyper.visorcore.com/browser`.
-- The relay maps `workspace_id + host_id + session_id`.
-- Management commands stay in the Hyper Portal API; console traffic moves to the relay.
+- Preferred no-VPS path: browser and agent connect to the Cloudflare Worker at `/signal/{sessionId}` with HMAC-signed short-lived URLs.
+- Cloudflare Durable Object maps `workspace_id + host_id + session_id` and forwards WebRTC offer, answer, and ICE messages.
+- WebRTC media should flow directly between browser and Hyper Agent when possible.
+- Cloudflare STUN is used for discovery; Cloudflare TURN can be enabled as fallback when restrictive NAT/firewalls block direct media.
+- Management commands stay in the Hyper Portal API; console signaling moves to Cloudflare; console media should not touch reseller PHP hosting.
 
 ## Message Types
 
@@ -30,7 +31,7 @@ All control messages are UTF-8 JSON.
 { "type": "console.input.mouse", "sessionId": "vcs_x", "x": 512, "y": 384, "button": "left", "action": "click" }
 ```
 
-Frames are binary WebSocket messages:
+Legacy relay frames are binary WebSocket messages:
 
 ```text
 uint32_be header_length
@@ -49,9 +50,23 @@ Example frame header:
 - Agent release binaries are Authenticode signed.
 - Agent update packages are hash-verified before install.
 - Agent registration exchanges the workspace bootstrap token for a host identity token.
-- Relay rejects unsigned or expired session tokens.
+- Cloudflare signaling Worker rejects unsigned or expired session tokens.
 - Browser console sessions require a short-lived session token issued by the Hyper Portal API.
 - Every console start, stop, input event, and transfer is audit logged.
+
+## Cloudflare Free-Tier Path
+
+The no-VPS deployment lives in `cloudflare/signaling-worker`.
+
+```text
+Reseller PHP portal creates console session
+  -> PHP mints browser + agent signaling URLs
+  -> Browser connects to Cloudflare Worker
+  -> Hyper Agent connects outbound to Cloudflare Worker
+  -> Durable Object forwards offer/answer/ICE
+  -> WebRTC connects browser directly to Hyper Agent where possible
+  -> TURN fallback is used only when direct NAT traversal fails
+```
 
 ## Console Backends
 

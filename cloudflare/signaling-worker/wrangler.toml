@@ -1,0 +1,17 @@
+name = "visorcore-console-signaling"
+main = "src/worker.js"
+compatibility_date = "2026-06-10"
+
+[[durable_objects.bindings]]
+name = "CONSOLE_ROOMS"
+class_name = "ConsoleRoom"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["ConsoleRoom"]
+
+[vars]
+ALLOWED_ORIGIN = "https://hyper.visorcore.com"
+
+# Set this secret after deployment:
+# wrangler secret put SIGNALING_SECRET

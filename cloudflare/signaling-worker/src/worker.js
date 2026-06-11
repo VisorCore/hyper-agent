@@ -113,7 +113,7 @@ export class ConsoleRoom {
 
     socket.addEventListener("message", (event) => {
       if (typeof event.data !== "string") {
-        this.send(socket, { type: "error", message: "Signaling accepts JSON text messages only." });
+        this.forwardBinary(auth.role, event.data);
         return;
       }
       let message;
@@ -157,6 +157,21 @@ export class ConsoleRoom {
     queue.push(message);
     while (queue.length > 128) queue.shift();
     this.queues.set(targetRole, queue);
+  }
+
+  forwardBinary(fromRole, payload) {
+    if (fromRole !== "agent") {
+      this.send(this.sockets.get(fromRole), { type: "error", message: "Binary console frames can only be sent by the Hyper Agent." });
+      return;
+    }
+    const targetRole = this.peerRole(fromRole);
+    const target = this.sockets.get(targetRole);
+    if (!target) {
+      return;
+    }
+    try {
+      target.send(payload);
+    } catch {}
   }
 
   flush(role) {

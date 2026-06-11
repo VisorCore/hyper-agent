@@ -85,6 +85,8 @@ function ConvertTo-VisorCoreGb {
 
 $script:VisorCoreConsoleSessions = @{}
 $script:VisorCoreLastConsoleFrames = @{}
+$script:VisorCoreConsoleSockets = @{}
+$script:VisorCoreConsoleSequences = @{}
 $script:VisorCoreStreamSessionId = [guid]::NewGuid().ToString("N")
 $script:VisorCoreLastControlLatencyMs = 0
 
@@ -255,9 +257,173 @@ function Get-VisorCoreVmConsoleFrame {
     }
 }
 
+function ConvertTo-VisorCoreUtf8Bytes {
+    param([string] $Text)
+    return [System.Text.Encoding]::UTF8.GetBytes([string] $Text)
+}
+
+function Send-VisorCoreConsoleSocketJson {
+    param(
+        $Socket,
+        [hashtable] $Payload
+    )
+    if ($null -eq $Socket -or $Socket.State -ne [System.Net.WebSockets.WebSocketState]::Open) { return }
+    $bytes = ConvertTo-VisorCoreUtf8Bytes (($Payload | ConvertTo-Json -Depth 8 -Compress))
+    $segment = [System.ArraySegment[byte]]::new($bytes)
+    $Socket.SendAsync($segment, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+}
+
+function Close-VisorCoreConsoleSocket {
+    param([string] $SessionId)
+    if ([string]::IsNullOrWhiteSpace($SessionId)) { return }
+    if ($script:VisorCoreConsoleSockets.ContainsKey($SessionId)) {
+        try {
+            $socket = $script:VisorCoreConsoleSockets[$SessionId]
+            if ($socket -and $socket.State -eq [System.Net.WebSockets.WebSocketState]::Open) {
+                $socket.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "session closed", [Threading.CancellationToken]::None).Wait(250)
+            }
+            if ($socket) { $socket.Dispose() }
+        } catch {}
+        $script:VisorCoreConsoleSockets.Remove($SessionId)
+    }
+}
+
+function Get-VisorCoreConsoleSocket {
+    param(
+        [string] $SessionId,
+        [string] $Url
+    )
+    if ([string]::IsNullOrWhiteSpace($Url)) { return $null }
+    if ($script:VisorCoreConsoleSockets.ContainsKey($SessionId)) {
+        $existing = $script:VisorCoreConsoleSockets[$SessionId]
+        if ($existing -and $existing.State -eq [System.Net.WebSockets.WebSocketState]::Open) {
+            return $existing
+        }
+        Close-VisorCoreConsoleSocket -SessionId $SessionId
+    }
+
+    $socket = [System.Net.WebSockets.ClientWebSocket]::new()
+    $socket.Options.SetRequestHeader("User-Agent", "VisorCore-Hyper-Agent/0.13.0")
+    $uri = [Uri] $Url
+    $socket.ConnectAsync($uri, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+    if ($socket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+        throw "Cloudflare console relay did not open."
+    }
+    $script:VisorCoreConsoleSockets[$SessionId] = $socket
+    Send-VisorCoreConsoleSocketJson -Socket $socket -Payload @{
+        type = "agent.hello"
+        transport = "cloudflare_ws"
+        version = "0.13.0"
+        sessionId = $SessionId
+    }
+    return $socket
+}
+
+function Invoke-VisorCoreConsoleInputMessage {
+    param(
+        [string] $VmName,
+        $Message,
+        $Socket
+    )
+    try {
+        $messageType = [string] $Message.type
+        switch ($messageType) {
+            "console.input.text" {
+                Send-VisorCoreVmConsoleText -VmName $VmName -Text ([string] $Message.text)
+                Send-VisorCoreConsoleSocketJson -Socket $Socket -Payload @{ type = "console.input.ack"; message = "Text sent to VM console." }
+            }
+            "console.input.key" {
+                $key = [string] $Message.key
+                if ($key -eq "CtrlAltDel" -or (($Message.chord -join ",") -match "Delete")) {
+                    Send-VisorCoreVmConsoleCtrlAltDel -VmName $VmName
+                    Send-VisorCoreConsoleSocketJson -Socket $Socket -Payload @{ type = "console.input.ack"; message = "Ctrl+Alt+Del sent to VM console." }
+                } else {
+                    Send-VisorCoreVmConsoleKey -VmName $VmName -KeyCode ([int] $Message.keyCode)
+                    Send-VisorCoreConsoleSocketJson -Socket $Socket -Payload @{ type = "console.input.ack"; message = "Key sent to VM console." }
+                }
+            }
+            "console.input.mouse" {
+                Send-VisorCoreVmConsoleMouse -VmName $VmName -X ([int] $Message.x) -Y ([int] $Message.y) -Button ([string] $Message.button) -MouseAction ([string] $Message.action)
+                Send-VisorCoreConsoleSocketJson -Socket $Socket -Payload @{ type = "console.input.ack"; message = "Mouse input sent to VM console." }
+            }
+            default {}
+        }
+    } catch {
+        Send-VisorCoreConsoleSocketJson -Socket $Socket -Payload @{ type = "console.input.error"; message = $_.Exception.Message }
+    }
+}
+
+function Receive-VisorCoreConsoleSocketMessages {
+    param(
+        [string] $SessionId,
+        [string] $VmName,
+        $Socket
+    )
+    if ($null -eq $Socket -or $Socket.State -ne [System.Net.WebSockets.WebSocketState]::Open) { return }
+    for ($i = 0; $i -lt 4; $i++) {
+        $buffer = New-Object byte[] 65536
+        $segment = [System.ArraySegment[byte]]::new($buffer)
+        $cts = [Threading.CancellationTokenSource]::new()
+        $cts.CancelAfter(5)
+        try {
+            $task = $Socket.ReceiveAsync($segment, $cts.Token)
+            $result = $task.GetAwaiter().GetResult()
+            if ($result.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Close) {
+                Close-VisorCoreConsoleSocket -SessionId $SessionId
+                return
+            }
+            if ($result.Count -le 0 -or $result.MessageType -ne [System.Net.WebSockets.WebSocketMessageType]::Text) {
+                return
+            }
+            $text = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $result.Count)
+            $message = $text | ConvertFrom-Json
+            Invoke-VisorCoreConsoleInputMessage -VmName $VmName -Message $message -Socket $Socket
+        } catch [System.OperationCanceledException] {
+            return
+        } catch {
+            Write-VisorCoreAgentLog ("console relay receive failed: " + $_.Exception.Message)
+            return
+        } finally {
+            $cts.Dispose()
+        }
+    }
+}
+
+function Send-VisorCoreConsoleSocketFrame {
+    param(
+        [string] $SessionId,
+        $Socket,
+        [hashtable] $Frame
+    )
+    if ($null -eq $Socket -or $Socket.State -ne [System.Net.WebSockets.WebSocketState]::Open) { return }
+    if (-not $script:VisorCoreConsoleSequences.ContainsKey($SessionId)) {
+        $script:VisorCoreConsoleSequences[$SessionId] = 0
+    }
+    $script:VisorCoreConsoleSequences[$SessionId] = [int] $script:VisorCoreConsoleSequences[$SessionId] + 1
+    $imageBytes = [Convert]::FromBase64String([string] $Frame.data)
+    $header = @{
+        type = "console.frame"
+        sessionId = $SessionId
+        mime = [string] $Frame.mime
+        width = [int] $Frame.width
+        height = [int] $Frame.height
+        capturedAtUtc = [string] $Frame.captured_at
+        sequence = [int] $script:VisorCoreConsoleSequences[$SessionId]
+    }
+    $headerBytes = ConvertTo-VisorCoreUtf8Bytes (($header | ConvertTo-Json -Depth 5 -Compress))
+    $lengthBytes = [BitConverter]::GetBytes([UInt32] $headerBytes.Length)
+    if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($lengthBytes) }
+    $packet = New-Object byte[] (4 + $headerBytes.Length + $imageBytes.Length)
+    [Buffer]::BlockCopy($lengthBytes, 0, $packet, 0, 4)
+    [Buffer]::BlockCopy($headerBytes, 0, $packet, 4, $headerBytes.Length)
+    [Buffer]::BlockCopy($imageBytes, 0, $packet, (4 + $headerBytes.Length), $imageBytes.Length)
+    $segment = [System.ArraySegment[byte]]::new($packet)
+    $Socket.SendAsync($segment, [System.Net.WebSockets.WebSocketMessageType]::Binary, $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+}
+
 function Get-VisorCoreInventory {
     $inventory = @{
-        agent_version = "0.12.0"
+        agent_version = "0.13.0"
         synced_at_utc = (Get-Date).ToUniversalTime().ToString("o")
         host = @{}
         console = @{
@@ -582,6 +748,8 @@ Install-VisorCoreAgentTask -InstallRoot "$root" | Out-Null
                     session_id = $sessionId
                     vm_name = $targetName
                     expires_at = $expiresAt
+                    transport = [string] $options.transport
+                    signaling_url = [string] $options.signaling_url
                 }
                 $script:VisorCoreLastConsoleFrames[$sessionId] = [datetime]::MinValue
                 $result.message = "Console relay prepared for VM '$targetName'."
@@ -794,7 +962,7 @@ function Invoke-VisorCoreControlPlane {
         [int] $WaitSeconds = 25
     )
 
-    $Payload["agent_version"] = "0.12.0"
+    $Payload["agent_version"] = "0.13.0"
     $Payload["agent_transport"] = "outbound_tls_long_poll"
     $Payload["stream_session_id"] = if ($script:VisorCoreStreamSessionId) { $script:VisorCoreStreamSessionId } else { "" }
     $Payload["service_status"] = "live_stream_connected"
@@ -833,13 +1001,17 @@ function Invoke-VisorCoreConsoleStreams {
         try {
             $expires = [datetime] $session.expires_at
             if ($expires.ToUniversalTime() -lt $nowUtc) {
+                Close-VisorCoreConsoleSocket -SessionId $sessionId
                 $script:VisorCoreConsoleSessions.Remove($sessionId)
                 $script:VisorCoreLastConsoleFrames.Remove($sessionId)
+                $script:VisorCoreConsoleSequences.Remove($sessionId)
                 continue
             }
         } catch {
+            Close-VisorCoreConsoleSocket -SessionId $sessionId
             $script:VisorCoreConsoleSessions.Remove($sessionId)
             $script:VisorCoreLastConsoleFrames.Remove($sessionId)
+            $script:VisorCoreConsoleSequences.Remove($sessionId)
             continue
         }
 
@@ -852,6 +1024,24 @@ function Invoke-VisorCoreConsoleStreams {
         }
         $script:VisorCoreLastConsoleFrames[$sessionId] = $nowUtc
 
+        $frame = $null
+        try {
+            $signalingUrl = [string] $session.signaling_url
+            $frame = Get-VisorCoreVmConsoleFrame -VmName ([string] $session.vm_name)
+            if (-not [string]::IsNullOrWhiteSpace($signalingUrl)) {
+                $socket = Get-VisorCoreConsoleSocket -SessionId $sessionId -Url $signalingUrl
+                Receive-VisorCoreConsoleSocketMessages -SessionId $sessionId -VmName ([string] $session.vm_name) -Socket $socket
+                Send-VisorCoreConsoleSocketFrame -SessionId $sessionId -Socket $socket -Frame $frame
+                continue
+            }
+        } catch {
+            Write-VisorCoreAgentLog ("console relay stream failed: " + $_.Exception.Message)
+            Close-VisorCoreConsoleSocket -SessionId $sessionId
+            if (-not [string]::IsNullOrWhiteSpace([string] $session.signaling_url)) {
+                continue
+            }
+        }
+
         $framePayload = @{}
         foreach ($key in $Payload.Keys) {
             $framePayload[$key] = $Payload[$key]
@@ -860,7 +1050,9 @@ function Invoke-VisorCoreConsoleStreams {
         $framePayload["vm_name"] = [string] $session.vm_name
 
         try {
-            $frame = Get-VisorCoreVmConsoleFrame -VmName ([string] $session.vm_name)
+            if ($null -eq $frame) {
+                $frame = Get-VisorCoreVmConsoleFrame -VmName ([string] $session.vm_name)
+            }
             $framePayload["status"] = "streaming"
             $framePayload["mime"] = $frame.mime
             $framePayload["frame_data"] = $frame.data
@@ -892,7 +1084,7 @@ function New-VisorCoreBasePayload {
         hyperv_module_available = [bool] $Config.hyperv_module_available
         require_mfa = [bool] $Config.require_mfa
         service_status = if ($Mode -eq "Inventory") { "inventory_task_running" } else { "control_stream_running" }
-        agent_version = "0.12.0"
+        agent_version = "0.13.0"
         agent_transport = "outbound_tls_long_poll"
         stream_session_id = [string] $script:VisorCoreStreamSessionId
         latency = @{
@@ -1040,10 +1232,10 @@ try {
     `$inventoryState = "Unknown"
     try { `$state = (Get-ScheduledTask -TaskPath `$taskPath -TaskName `$taskName -ErrorAction Stop).State } catch {}
     try { `$inventoryState = (Get-ScheduledTask -TaskPath `$taskPath -TaskName `$inventoryTaskName -ErrorAction Stop).State } catch {}
-    @{ success = `$true; version = "0.12.0"; state = [string] `$state; inventory_state = [string] `$inventoryState; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
+    @{ success = `$true; version = "0.13.0"; state = [string] `$state; inventory_state = [string] `$inventoryState; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
     Write-ApplyLog ("tasks started: control=" + `$state + " inventory=" + `$inventoryState)
 } catch {
-    @{ success = `$false; version = "0.12.0"; message = `$_.Exception.Message; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
+    @{ success = `$false; version = "0.13.0"; message = `$_.Exception.Message; applied_at_utc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Depth 4 | Set-Content -Path `$statusPath -Encoding UTF8
     Write-ApplyLog ("apply failed: " + `$_.Exception.Message)
 }
 try { Unregister-ScheduledTask -TaskPath `$taskPath -TaskName `$applyTaskName -Confirm:`$false -ErrorAction SilentlyContinue } catch {}

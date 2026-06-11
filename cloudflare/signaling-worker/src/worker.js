@@ -111,9 +111,9 @@ export class ConsoleRoom {
     this.send(socket, { type: `${auth.role}.ready`, sessionId: auth.sessionId, workspace: auth.workspace, host: auth.host });
     this.flush(auth.role);
 
-    socket.addEventListener("message", (event) => {
+    socket.addEventListener("message", async (event) => {
       if (typeof event.data !== "string") {
-        this.forwardBinary(auth.role, event.data);
+        await this.forwardBinary(auth.role, event.data);
         return;
       }
       let message;
@@ -159,7 +159,7 @@ export class ConsoleRoom {
     this.queues.set(targetRole, queue);
   }
 
-  forwardBinary(fromRole, payload) {
+  async forwardBinary(fromRole, payload) {
     if (fromRole !== "agent") {
       this.send(this.sockets.get(fromRole), { type: "error", message: "Binary console frames can only be sent by the Hyper Agent." });
       return;
@@ -170,7 +170,15 @@ export class ConsoleRoom {
       return;
     }
     try {
-      target.send(payload);
+      if (payload instanceof ArrayBuffer) {
+        target.send(payload);
+      } else if (payload?.arrayBuffer) {
+        target.send(await payload.arrayBuffer());
+      } else if (ArrayBuffer.isView(payload)) {
+        target.send(payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength));
+      } else {
+        target.send(payload);
+      }
     } catch {}
   }
 

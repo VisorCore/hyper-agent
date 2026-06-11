@@ -8,7 +8,7 @@ class_name = "ConsoleRoom"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["ConsoleRoom"]
+new_sqlite_classes = ["ConsoleRoom"]
 
 [vars]
 ALLOWED_ORIGIN = "https://hyper.visorcore.com"
